@@ -2,9 +2,10 @@
 """Scans default project directories and global Python installations for litellm.
 
 This is the fleet-scanning wrapper around :mod:`safe_litellm_detector`.  It
-walks ``~/projects``, ``~/work``, any extra CLI paths, and every global Python
-installation, then feeds discovered ``site-packages`` directories into the
-detector's filesystem-only inspection engine.
+walks ``~/projects``, ``~/work``, Windows workspace directories (``C:\\ws``
+and ``C:\\ws_*`` in any capitalisation), any extra CLI paths, and every global
+Python installation, then feeds discovered ``site-packages`` directories into
+the detector's filesystem-only inspection engine.
 
 Usage::
 
@@ -17,8 +18,8 @@ from __future__ import annotations
 
 import abc
 import argparse
+import glob
 import os
-import re
 import sys
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -28,13 +29,17 @@ from typing import Iterable, Sequence
 from safe_litellm_detector import (
     Classification,
     SitePackagesFinding,
-    TargetReport,
-    discover_site_packages,
-    format_report_json,
+    discover_global_site_packages,
     inspect_site_packages,
-    worst_exit_code,
-    EXIT_CLEAN,
     EXIT_ERROR,
+    _c,
+    _BOLD,
+    _RED,
+    _RESET,
+    _YELLOW,
+    _CLS_COLORS,
+    _CLS_ICONS,
+    _safe_resolve as _safe_resolve_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -43,19 +48,6 @@ from safe_litellm_detector import (
 
 _VENV_DIR_NAMES: tuple[str, ...] = (
     ".venv", "venv", "env", ".env", "ENV", "virtenv", ".virtenv",
-)
-
-_IS_WINDOWS = sys.platform == "win32"
-
-_WELL_KNOWN_PYTHONS_UNIX: tuple[str, ...] = (
-    "/usr/bin/python3",
-    "/usr/local/bin/python3",
-    "/opt/homebrew/bin/python3",
-)
-
-_PYTHON_EXE_RE = re.compile(
-    r"^python\d?(\.\d+)?(\.exe)?$" if _IS_WINDOWS
-    else r"^python\d?(\.\d+)?$"
 )
 
 # ---------------------------------------------------------------------------
@@ -120,7 +112,12 @@ class EnvironmentDiscovery(abc.ABC):
 
 
 class RepoVenvDiscovery(EnvironmentDiscovery):
-    """Finds ``site-packages`` inside virtual environments in Git repos."""
+    """Finds ``site-packages`` inside virtual environments in Git repos.
+
+    Searches the entire subtree of each repo for recognised venv directory
+    names, so nested venvs (e.g. ``monorepo/services/svc/.venv``) are found
+    too.
+    """
 
     def __init__(self, root_dirs: Sequence[Path]) -> None:
         self._root_dirs = root_dirs
@@ -148,94 +145,92 @@ class RepoVenvDiscovery(EnvironmentDiscovery):
 
     @staticmethod
     def _find_venv_site_packages(repo: Path) -> list[Path]:
-        """Returns every ``site-packages`` directory inside recognised venvs."""
+        """Returns every ``site-packages`` directory inside recognised venvs.
+
+        Walks the entire *repo* tree so that nested venvs (e.g. inside
+        sub-projects or service directories) are discovered.
+        """
         results: list[Path] = []
-        for name in _VENV_DIR_NAMES:
-            venv = repo / name
-            if not venv.is_dir():
-                continue
-            results.extend(sorted(venv.glob("lib/python*/site-packages")))
-            sp = venv / "Lib" / "site-packages"
-            if sp.is_dir():
-                results.append(sp)
+        seen: set[Path] = set()
+
+        def _add_from_venv(venv: Path) -> None:
+            for sp in sorted(venv.glob("lib/python*/site-packages")):
+                try:
+                    resolved = sp.resolve()
+                except OSError:
+                    continue
+                if resolved not in seen and sp.is_dir():
+                    seen.add(resolved)
+                    results.append(sp)
+            lib_sp = venv / "Lib" / "site-packages"
+            if lib_sp.is_dir():
+                try:
+                    resolved = lib_sp.resolve()
+                except OSError:
+                    return
+                if resolved not in seen:
+                    seen.add(resolved)
+                    results.append(lib_sp)
+
+        # Walk the repo tree for any recognised venv directory name.
+        try:
+            for dirpath, dirnames, _ in os.walk(repo, followlinks=False):
+                current = Path(dirpath)
+                matched: list[str] = []
+                for name in dirnames:
+                    if name in _VENV_DIR_NAMES:
+                        _add_from_venv(current / name)
+                        matched.append(name)
+                # Don't descend into the matched venv dirs themselves.
+                for name in matched:
+                    dirnames.remove(name)
+        except (PermissionError, OSError):
+            pass
+
         return results
+
+
+class StandaloneVenvDiscovery(EnvironmentDiscovery):
+    """Finds ``site-packages`` inside virtual environments that live outside
+    Git repositories (e.g. JetBrains/IDE caches, standalone venvs)."""
+
+    def __init__(self, root_dirs: Sequence[Path]) -> None:
+        self._root_dirs = root_dirs
+
+    def discover(self) -> Iterable[tuple[str, Path, EnvKind]]:
+        for root in self._root_dirs:
+            if not root.is_dir():
+                continue
+            try:
+                for sp in sorted(root.rglob("site-packages")):
+                    if sp.is_dir():
+                        yield self._label_for(sp), sp, EnvKind.REPOSITORY
+            except (PermissionError, OSError):
+                continue
+
+    @staticmethod
+    def _label_for(sp: Path) -> str:
+        """Derives a human-readable label from a ``site-packages`` path."""
+        # Walk up to the venv root: lib/pythonX.Y/site-packages → 3 up,
+        # Lib/site-packages → 2 up.
+        parent = sp.parent
+        if parent.name.startswith("python"):
+            env_root = parent.parent.parent
+        else:
+            env_root = parent.parent
+        return f"{env_root.name} (venv)"
 
 
 class GlobalPythonDiscovery(EnvironmentDiscovery):
     """Discovers ``site-packages`` for system-wide Python interpreters.
 
-    Derives paths from the filesystem layout of each interpreter — the
-    interpreter itself is **never executed**.
+    Delegates to :func:`safe_litellm_detector.discover_global_site_packages`
+    so the discovery logic lives in one place.
     """
 
     def discover(self) -> Iterable[tuple[str, Path, EnvKind]]:
-        seen: set[Path] = set()
-        for python in self._collect_pythons():
-            for sp in self._site_packages_for(python):
-                resolved = _safe_resolve(sp)
-                if resolved is None or resolved in seen:
-                    continue
-                seen.add(resolved)
-                yield f"System ({python})", sp, EnvKind.GLOBAL
-
-    @staticmethod
-    def _collect_pythons() -> Iterable[Path]:
-        """Yields candidate Python executables (never runs them)."""
-        yield Path(sys.executable)
-
-        if _IS_WINDOWS:
-            yield from _well_known_pythons_windows()
-        else:
-            for p in _WELL_KNOWN_PYTHONS_UNIX:
-                path = Path(p)
-                if path.exists():
-                    yield path
-
-        yield from _pythons_on_path()
-
-    @staticmethod
-    def _site_packages_for(python: Path) -> list[Path]:
-        """Infers ``site-packages`` from *python*'s filesystem location."""
-        results: list[Path] = []
-        resolved = _safe_resolve(python)
-        if resolved is None:
-            return results
-
-        # On Unix, python lives at <prefix>/bin/pythonX.Y → two levels up.
-        # On Windows, python lives at <prefix>/python.exe → one level up.
-        if _IS_WINDOWS:
-            prefix = resolved.parent
-        else:
-            prefix = resolved.parent.parent
-
-        # Unix:    <prefix>/lib/pythonX.Y/site-packages
-        results.extend(prefix.glob("lib/python*/site-packages"))
-
-        # Windows: <prefix>/Lib/site-packages
-        lib_sp = prefix / "Lib" / "site-packages"
-        if lib_sp.is_dir():
-            results.append(lib_sp)
-
-        if not _IS_WINDOWS:
-            # macOS Homebrew
-            results.extend(
-                Path("/opt/homebrew/lib").glob("python*/site-packages")
-            )
-            results.extend(
-                Path("/usr/local/lib").glob("python*/site-packages")
-            )
-
-            # macOS Xcode / CommandLineTools
-            for clt in (
-                Path("/Library/Developer/CommandLineTools/Library/Frameworks/"
-                     "Python3.framework/Versions"),
-                Path("/Applications/Xcode.app/Contents/Developer/Library/"
-                     "Frameworks/Python3.framework/Versions"),
-            ):
-                if clt.is_dir():
-                    results.extend(clt.glob("*/lib/python*/site-packages"))
-
-        return [p for p in results if p.is_dir()]
+        for label, sp in discover_global_site_packages():
+            yield label, sp, EnvKind.GLOBAL
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +257,7 @@ class Auditor:
 
         for discovery in self._discoveries:
             for label, site_packages, kind in discovery.discover():
-                resolved = _safe_resolve(site_packages)
+                resolved = _safe_resolve_path(site_packages)
                 if resolved is None or resolved in seen:
                     continue
                 seen.add(resolved)
@@ -281,56 +276,12 @@ class Auditor:
 # ---------------------------------------------------------------------------
 
 
-def _enable_ansi_if_needed() -> bool:
-    """Enables ANSI escape processing on Windows; returns True if supported."""
-    if not _IS_WINDOWS:
-        return True
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        # STD_OUTPUT_HANDLE = -11, ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x4
-        handle = kernel32.GetStdHandle(-11)
-        mode = ctypes.c_ulong()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | 0x4)
-            return True
-    except Exception:
-        pass
-    return False
-
-
-class _Colors:
-    """ANSI escape sequences (disabled when stdout is not a TTY or unsupported)."""
-
-    _on = sys.stdout.isatty() and _enable_ansi_if_needed()
-
-    GREEN = "\033[92m" if _on else ""
-    RED = "\033[91m" if _on else ""
-    YELLOW = "\033[93m" if _on else ""
-    BOLD = "\033[1m" if _on else ""
-    RESET = "\033[0m" if _on else ""
-
-
-_CLS_STYLE: dict[Classification, tuple[str, str]] = {}
-
-
-def _cls_style(cls: Classification) -> tuple[str, str]:
-    """Returns ``(color, icon)`` for a classification."""
-    c = _Colors
-    return {
-        Classification.CLEAN: (c.GREEN, "✔"),
-        Classification.SUSPICIOUS: (c.YELLOW, "⚠"),
-        Classification.COMPROMISED_CANDIDATE: (c.RED, "✘"),
-    }[cls]
-
-
 def print_report(report: AuditReport) -> None:
     """Prints a human-readable audit report to stdout."""
-    c = _Colors
     _banner("AUDIT SUMMARY")
 
     if not report.findings:
-        print(f"{c.YELLOW}No environments found to check.{c.RESET}\n")
+        print(f"{_c(_YELLOW)}No environments found to check.{_c(_RESET)}\n")
     else:
         for kind, heading in (
             (EnvKind.REPOSITORY, "Repository Virtual Environments"),
@@ -339,44 +290,42 @@ def print_report(report: AuditReport) -> None:
             group = report.by_kind(kind)
             if not group:
                 continue
-            print(f"{c.BOLD}{heading}:{c.RESET}")
+            print(f"{_c(_BOLD)}{heading}:{_c(_RESET)}")
             for af in group:
                 _print_finding(af)
             print()
 
         print(
-            f"{c.BOLD}Total environments checked: "
-            f"{report.total_checked}{c.RESET}"
+            f"{_c(_BOLD)}Total environments checked: "
+            f"{report.total_checked}{_c(_RESET)}"
         )
 
     _banner("FINAL VERDICT")
     worst = report.worst_classification
-
-    color, _ = _cls_style(worst)
+    color = _CLS_COLORS[worst]
     verdicts = {
         Classification.CLEAN: "no issues found",
         Classification.SUSPICIOUS: "suspicious — review needed",
         Classification.COMPROMISED_CANDIDATE: "possibly compromised",
     }
-    print(f"{color}{c.BOLD}{verdicts[worst]}{c.RESET}")
+    print(f"{_c(color)}{_c(_BOLD)}{verdicts[worst]}{_c(_RESET)}")
 
 
 def _banner(title: str) -> None:
     """Prints a section banner line."""
-    c = _Colors
     sep = "=" * 70
-    print(f"\n{c.BOLD}{sep}\n{title}\n{sep}{c.RESET}\n")
+    print(f"\n{_c(_BOLD)}{sep}\n{title}\n{sep}{_c(_RESET)}\n")
 
 
 def _print_finding(af: AuditFinding) -> None:
     """Prints a single environment finding."""
-    c = _Colors
     f = af.detail
-    color, icon = _cls_style(f.classification)
+    color = _CLS_COLORS[f.classification]
+    icon = _CLS_ICONS[f.classification]
 
-    print(f"\n  {color}{icon}{c.RESET} {af.label}")
+    print(f"\n  {_c(color)}{icon}{_c(_RESET)} {af.label}")
     print(f"      site-packages: {f.path}")
-    print(f"      Status: {color}{c.BOLD}{f.classification.value}{c.RESET}")
+    print(f"      Status: {_c(color)}{_c(_BOLD)}{f.classification.value}{_c(_RESET)}")
 
     if f.reasons:
         for reason in f.reasons:
@@ -384,11 +333,11 @@ def _print_finding(af: AuditFinding) -> None:
 
     if f.pth_present:
         print(
-            f"      {c.RED}{c.BOLD}"
-            f"litellm_init.pth BACKDOOR PRESENT{c.RESET}"
+            f"      {_c(_RED)}{_c(_BOLD)}"
+            f"litellm_init.pth BACKDOOR PRESENT{_c(_RESET)}"
         )
     if f.record_mentions_pth:
-        print(f"      {c.RED}RECORD references litellm_init.pth{c.RESET}")
+        print(f"      {_c(_RED)}RECORD references litellm_init.pth{_c(_RESET)}")
 
 
 def print_json_report(report: AuditReport) -> None:
@@ -407,55 +356,6 @@ def print_json_report(report: AuditReport) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _pythons_on_path() -> Iterable[Path]:
-    """Yields ``python*`` executables found on ``$PATH``."""
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        try:
-            for entry in Path(directory).iterdir():
-                if _PYTHON_EXE_RE.match(entry.name) and entry.is_file():
-                    yield entry
-        except (PermissionError, OSError):
-            continue
-
-
-def _well_known_pythons_windows() -> Iterable[Path]:
-    """Yields common Python install locations on Windows."""
-    # Python.org installer defaults
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    if localappdata:
-        yield from sorted(
-            Path(localappdata, "Programs", "Python").glob("Python*/python.exe")
-        )
-
-    # System-wide installs
-    for root in (os.environ.get("PROGRAMFILES", ""),
-                 os.environ.get("PROGRAMFILES(X86)", "")):
-        if root:
-            yield from sorted(Path(root).glob("Python*/python.exe"))
-
-    # Windows Store / App Installer
-    appdata = os.environ.get("LOCALAPPDATA", "")
-    if appdata:
-        pkgs = Path(appdata, "Microsoft", "WindowsApps")
-        if pkgs.is_dir():
-            for entry in sorted(pkgs.glob("python*.exe")):
-                if _PYTHON_EXE_RE.match(entry.name) and entry.is_file():
-                    yield entry
-
-
-def _safe_resolve(path: Path) -> Path | None:
-    """Resolves a symlink / relative path, returning ``None`` on failure."""
-    try:
-        return path.resolve()
-    except OSError:
-        return None
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -466,8 +366,9 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="audit_litellm",
         description=(
             "Scans project directories and global Python installations for "
-            "litellm.  Uses filesystem-only inspection — never executes a "
-            "suspect interpreter."
+            "litellm.  On Windows, C:\\ws and C:\\ws_* (all caps variants) "
+            "are included automatically.  Uses filesystem-only inspection — "
+            "never executes a suspect interpreter."
         ),
     )
     parser.add_argument(
@@ -475,7 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="*",
         type=Path,
         metavar="DIR",
-        help="Additional directories to scan (beyond ~/projects and ~/work).",
+        help="Additional directories to scan (beyond ~/projects, ~/work, and C:\\ws* on Windows).",
     )
     parser.add_argument(
         "--json",
@@ -506,6 +407,36 @@ _EXIT_FOR_CLASSIFICATION: dict[Classification, int] = {
 }
 
 
+def _discover_windows_workspace_dirs() -> list[Path]:
+    """Returns Windows workspace directories matching ``C:\\ws`` and ``C:\\ws_*``.
+
+    On Windows, all drive-letter / prefix capitalization variants are checked:
+    ``C:\\ws``, ``C:\\WS``, ``C:\\Ws``, ``C:\\wS``, ``C:\\ws_foo``, etc.
+    The glob pattern ``C:\\[wW][sS]`` plus ``C:\\[wW][sS]_*`` covers every
+    combination.
+
+    Returns an empty list on non-Windows platforms.
+    """
+    if sys.platform != "win32":
+        return []
+
+    dirs: list[Path] = []
+    seen: set[Path] = set()
+
+    for pattern in (r"C:\[wW][sS]", r"C:\[wW][sS]_*"):
+        for match in glob.glob(pattern):
+            p = Path(match)
+            try:
+                resolved = p.resolve()
+            except OSError:
+                continue
+            if resolved not in seen and p.is_dir():
+                seen.add(resolved)
+                dirs.append(p)
+
+    return dirs
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Runs the fleet audit and returns an exit code."""
     parser = _build_parser()
@@ -513,11 +444,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     home = Path.home()
     root_dirs = [home / "projects", home / "work"]
+    root_dirs.extend(_discover_windows_workspace_dirs())
     if args.extra_dirs:
         root_dirs.extend(p.expanduser() for p in args.extra_dirs)
 
+    # StandaloneVenvDiscovery scans the entire home directory to catch
+    # environments that live outside Git repos (IDE caches, standalone
+    # venvs, etc.).  The Auditor deduplicates resolved paths, so overlap
+    # with RepoVenvDiscovery is harmless.
     discoveries: list[EnvironmentDiscovery] = [
         RepoVenvDiscovery(root_dirs),
+        StandaloneVenvDiscovery([home] + root_dirs),
         GlobalPythonDiscovery(),
     ]
 

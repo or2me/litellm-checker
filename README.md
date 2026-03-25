@@ -1,7 +1,7 @@
 # litellm-check
 
 Incident-response-safe detection of compromised `litellm` installations.
-**Filesystem inspection only** — no suspect interpreter is ever executed.
+Filesystem inspection only — no suspect interpreter is ever executed.
 
 ## Why Filesystem-Only?
 
@@ -18,41 +18,75 @@ metadata and directory listings as ordinary files.
 
 See [BerriAI/litellm#24512](https://github.com/BerriAI/litellm/issues/24512).
 
-## Tools
+---
 
-### `safe_litellm_detector.py` — single-target detector
-
-Point it at a venv, conda env, or `site-packages` directory:
+## Quick Start
 
 ```bash
-python3 safe_litellm_detector.py /path/to/venv
-python3 safe_litellm_detector.py /path/to/site-packages --json
-python3 safe_litellm_detector.py ~/work --recursive
-python3 safe_litellm_detector.py /opt/envs --strict-1827 --quiet
+# Scan your entire home folder — finds every venv, conda env, IDE cache, and global install
+python3 safe_litellm_detector.py ~ --recursive
+
+# Or let the fleet scanner check all the common places automatically
+python3 audit_litellm.py
 ```
 
-### `audit_litellm.py` — fleet scanner
+## Two Tools
 
-Walks `~/projects`, `~/work`, any extra CLI paths, and every global Python
-installation:
+### `safe_litellm_detector.py` — point-and-shoot detector
+
+Accepts any path: a single venv, a `site-packages` dir, or a whole directory
+tree with `--recursive`.
+
+```bash
+python3 safe_litellm_detector.py /path/to/.venv
+python3 safe_litellm_detector.py ~/projects/my-app --recursive
+python3 safe_litellm_detector.py /mnt/shared --recursive --json
+python3 safe_litellm_detector.py ~ --recursive --no-global      # skip system Pythons
+python3 safe_litellm_detector.py ~/code --recursive --quiet && echo "clean"
+```
+
+### `audit_litellm.py` — zero-argument fleet scanner
+
+Scans default project locations, IDE caches, standalone venvs, and global
+Python installations with no arguments. Pass extra directories to widen the
+search.
 
 ```bash
 python3 audit_litellm.py
-python3 audit_litellm.py ~/src --json
+python3 audit_litellm.py ~/src /mnt/shared-envs --json
 python3 audit_litellm.py --strict-1827 --quiet
 ```
 
-## Classification Model
+Default scan roots:
 
-| Classification            | Meaning                                                                                                                  |
-|---------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| **clean**                 | No `litellm` artifacts found                                                                                             |
-| **suspicious**            | `litellm` present but no high-confidence IOCs (e.g. benign version, malformed metadata, missing dist-info)               |
-| **compromised-candidate** | Matches known IOCs: version 1.82.8, `litellm_init.pth`, RECORD references `.pth`, or version 1.82.7 with `--strict-1827` |
+| Platform      | Directories                                                                    |
+|---------------|--------------------------------------------------------------------------------|
+| macOS / Linux | `~/projects`, `~/work`, `~` (IDE caches & standalone venvs), global Pythons    |
+| Windows       | `~/projects`, `~/work`, `C:\ws`, `C:\ws_*` (all caps variants), global Pythons |
 
-## What It Checks
+### Which tool should I use?
 
-For every `site-packages` directory:
+| Scenario                                  | Recommended                                 |
+|-------------------------------------------|---------------------------------------------|
+| Quick check of the most common places     | `audit_litellm.py`                          |
+| Thorough scan of `~` or an arbitrary path | `safe_litellm_detector.py PATH --recursive` |
+| CI / scripting (exit-code only)           | either tool with `--quiet`                  |
+| Machine-readable output                   | either tool with `--json`                   |
+
+Both tools discover the same union of environments and deduplicate by resolved
+path, so overlapping scan roots are safe.
+
+---
+
+## Classification
+
+| Result                    | Meaning                                                                                     |
+|---------------------------|---------------------------------------------------------------------------------------------|
+| **clean**                 | No `litellm` artifacts found.                                                               |
+| **suspicious**            | `litellm` present but no high-confidence IOCs (benign version, missing/malformed metadata). |
+| **compromised-candidate** | Known IOCs: version 1.82.8, `litellm_init.pth`, RECORD→`.pth`, or 1.82.7 + `--strict-1827`. |
+
+### Inspected artifacts
 
 | Artifact                       | Signal                          |
 |--------------------------------|---------------------------------|
@@ -63,7 +97,7 @@ For every `site-packages` directory:
 | Multiple `dist-info` dirs      | Suspicious (version conflict)   |
 | Missing / malformed metadata   | Suspicious                      |
 
-## Exit Codes
+### Exit codes
 
 | Code | Meaning               |
 |------|-----------------------|
@@ -72,9 +106,12 @@ For every `site-packages` directory:
 | `2`  | compromised-candidate |
 | `3`  | operational error     |
 
-## Sample Output
+---
 
-### Human-readable
+## Output Examples
+
+<details>
+<summary>Human-readable</summary>
 
 ```
 Target: /opt/app/.venv
@@ -89,7 +126,10 @@ Target: /opt/app/.venv
     RECORD references litellm_init.pth
 ```
 
-### JSON (`--json`)
+</details>
+
+<details>
+<summary>JSON (<code>--json</code>)</summary>
 
 ```json
 [
@@ -103,43 +143,68 @@ Target: /opt/app/.venv
         "pth_present": true,
         "record_mentions_pth": true,
         "classification": "compromised-candidate",
-        "reasons": ["version=1.82.8", "litellm_init.pth present", "RECORD mentions litellm_init.pth"]
+        "reasons": [
+          "version=1.82.8",
+          "litellm_init.pth present",
+          "RECORD mentions litellm_init.pth"
+        ]
       }
     ]
   }
 ]
 ```
 
+</details>
+
+---
+
+## CLI Reference
+
+### `safe_litellm_detector.py [OPTIONS] TARGET [TARGET ...]`
+
+| Flag            | Description                                                               |
+|-----------------|---------------------------------------------------------------------------|
+| `TARGET`        | Paths to inspect — venv roots, `site-packages` dirs, or directory trees.  |
+| `--recursive`   | Recursively find all `site-packages` under each target; includes globals. |
+| `--no-global`   | Skip global Python installs (only meaningful with `--recursive`).         |
+| `--json`        | Emit JSON instead of human-readable text.                                 |
+| `--strict-1827` | Treat version 1.82.7 as **compromised-candidate** instead of suspicious.  |
+| `--quiet`       | Suppress output; exit code only.                                          |
+
+### `audit_litellm.py [OPTIONS] [DIR ...]`
+
+| Flag            | Description                                                              |
+|-----------------|--------------------------------------------------------------------------|
+| `DIR`           | Extra directories to scan beyond the defaults.                           |
+| `--json`        | Emit JSON instead of human-readable text.                                |
+| `--strict-1827` | Treat version 1.82.7 as **compromised-candidate** instead of suspicious. |
+| `--quiet`       | Suppress output; exit code only.                                         |
+
+---
+
 ## Architecture
 
 ```
-safe_litellm_detector.py                audit_litellm.py
-┌───────────────────────┐         ┌──────────────────────────┐
-│ discover_site_packages│◄─────── │ RepoVenvDiscovery        │
-│ inspect_site_packages │◄─────── │ GlobalPythonDiscovery    │
-│ classify()            │         │ Auditor                  │
-│ scan_target()         │         │ print_report()           │
-│ format_report_json()  │         │ print_json_report()      │
-└───────────────────────┘         └──────────────────────────┘
-     core detector                   fleet-scanning wrapper
+safe_litellm_detector.py                  audit_litellm.py
+┌──────────────────────────────┐    ┌──────────────────────────┐
+│ discover_site_packages       │◄───│ RepoVenvDiscovery        │
+│ inspect_site_packages        │◄───│ StandaloneVenvDiscovery  │
+│ discover_global_site_packages│◄───│ GlobalPythonDiscovery    │
+│ classify()                   │    │ Auditor                  │
+│ scan_target()                │    │ print_report()           │
+│ format_report_json()         │    │ print_json_report()      │
+└──────────────────────────────┘    └──────────────────────────┘
+     core detector                    fleet-scanning wrapper
 ```
 
 ## Testing
 
 ```bash
-# All tests
-python3 -m unittest test_detector test_audit -v
-
-# Detector only (42 tests)
-python3 -m unittest test_detector -v
-
-# Fleet scanner only (14 tests)
-python3 -m unittest test_audit -v
+python3 -m unittest test_detector test_audit -v   # all 66 tests
+python3 -m unittest test_detector -v              # detector only (42)
+python3 -m unittest test_audit -v                 # fleet scanner only (24)
 ```
 
 ## Requirements
 
-- Python 3.10+
-- Standard library only — no third-party dependencies
-- **Zero subprocess calls** — safe by design
-- Cross-platform: macOS, Linux, Windows
+Python 3.10+ · standard library only · zero subprocess calls · cross-platform (macOS, Linux, Windows)

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Unit tests for audit_litellm.py (fleet-scanning wrapper)."""
 
-import json
 import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -18,6 +18,8 @@ from audit_litellm import (
     EnvKind,
     GlobalPythonDiscovery,
     RepoVenvDiscovery,
+    StandaloneVenvDiscovery,
+    _discover_windows_workspace_dirs,
 )
 
 
@@ -96,6 +98,133 @@ class TestRepoVenvDiscovery(unittest.TestCase):
             self.assertEqual(path, sp)
             self.assertEqual(kind, EnvKind.REPOSITORY)
             self.assertIn("my_repo", label)
+
+    def test_finds_nested_venvs(self):
+        """Discovers venvs inside subdirectories of a repo (e.g. monorepo)."""
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "monorepo"
+            (repo / ".git").mkdir(parents=True)
+            # Top-level venv
+            top_sp = repo / ".venv" / "lib" / "python3.12" / "site-packages"
+            top_sp.mkdir(parents=True)
+            # Nested sub-project venv
+            nested_sp = repo / "services" / "api" / ".venv" / "lib" / "python3.12" / "site-packages"
+            nested_sp.mkdir(parents=True)
+
+            discovery = RepoVenvDiscovery([Path(d)])
+            results = list(discovery.discover())
+            paths = [r[1] for r in results]
+            self.assertEqual(len(paths), 2)
+            self.assertIn(top_sp, paths)
+            self.assertIn(nested_sp, paths)
+
+
+class TestStandaloneVenvDiscovery(unittest.TestCase):
+    """Tests for standalone (non-repo) venv discovery."""
+
+    def test_finds_standalone_venv(self):
+        """Discovers a venv that is not inside a Git repository."""
+        with tempfile.TemporaryDirectory() as d:
+            sp = Path(d) / "some_env" / "lib" / "python3.12" / "site-packages"
+            sp.mkdir(parents=True)
+            discovery = StandaloneVenvDiscovery([Path(d)])
+            results = list(discovery.discover())
+            self.assertEqual(len(results), 1)
+            _, path, kind = results[0]
+            self.assertEqual(path, sp)
+            self.assertEqual(kind, EnvKind.REPOSITORY)
+
+    def test_finds_deeply_nested_site_packages(self):
+        """Discovers site-packages in a deeply nested path (e.g. IDE cache)."""
+        with tempfile.TemporaryDirectory() as d:
+            sp = (Path(d) / "Library" / "Caches" / "IDE" / "project"
+                  / ".venv" / "lib" / "python3.12" / "site-packages")
+            sp.mkdir(parents=True)
+            discovery = StandaloneVenvDiscovery([Path(d)])
+            results = list(discovery.discover())
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0][1], sp)
+
+    def test_returns_empty_for_no_envs(self):
+        """Returns nothing when no site-packages exists."""
+        with tempfile.TemporaryDirectory() as d:
+            discovery = StandaloneVenvDiscovery([Path(d)])
+            results = list(discovery.discover())
+            self.assertEqual(results, [])
+
+
+class TestWindowsWorkspaceDirs(unittest.TestCase):
+    """Tests for Windows workspace directory discovery."""
+
+    @patch("audit_litellm.sys")
+    @patch("audit_litellm.glob.glob")
+    def test_returns_empty_on_non_windows(self, mock_glob, mock_sys):
+        """Should return nothing on non-Windows platforms."""
+        mock_sys.platform = "darwin"
+        result = _discover_windows_workspace_dirs()
+        self.assertEqual(result, [])
+        mock_glob.assert_not_called()
+
+    @patch("audit_litellm.sys")
+    @patch("audit_litellm.glob.glob")
+    def test_discovers_ws_directories_on_windows(self, mock_glob, mock_sys):
+        """Should discover C:\\ws and C:\\ws_* directories on Windows."""
+        mock_sys.platform = "win32"
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            ws_foo = Path(d) / "ws_foo"
+            ws.mkdir()
+            ws_foo.mkdir()
+
+            def _fake_glob(pattern):
+                if pattern == r"C:\[wW][sS]":
+                    return [str(ws)]
+                if pattern == r"C:\[wW][sS]_*":
+                    return [str(ws_foo)]
+                return []
+
+            mock_glob.side_effect = _fake_glob
+            result = _discover_windows_workspace_dirs()
+            self.assertEqual(len(result), 2)
+            self.assertIn(ws, result)
+            self.assertIn(ws_foo, result)
+
+    @patch("audit_litellm.sys")
+    @patch("audit_litellm.glob.glob")
+    def test_deduplicates_resolved_paths(self, mock_glob, mock_sys):
+        """Should not return the same resolved directory twice."""
+        mock_sys.platform = "win32"
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            ws.mkdir()
+
+            # Both patterns return the same directory
+            mock_glob.return_value = [str(ws)]
+            result = _discover_windows_workspace_dirs()
+            # Called twice (two patterns), but same dir → deduplicated
+            self.assertEqual(len(result), 1)
+
+    @patch("audit_litellm.sys")
+    @patch("audit_litellm.glob.glob")
+    def test_skips_non_directory_matches(self, mock_glob, mock_sys):
+        """Should skip matches that are not directories."""
+        mock_sys.platform = "win32"
+        with tempfile.TemporaryDirectory() as d:
+            ws_file = Path(d) / "ws"
+            ws_file.write_text("not a directory")
+
+            mock_glob.return_value = [str(ws_file)]
+            result = _discover_windows_workspace_dirs()
+            self.assertEqual(result, [])
+
+    @patch("audit_litellm.sys")
+    @patch("audit_litellm.glob.glob")
+    def test_returns_empty_when_no_matches(self, mock_glob, mock_sys):
+        """Should return nothing when no matching directories exist."""
+        mock_sys.platform = "win32"
+        mock_glob.return_value = []
+        result = _discover_windows_workspace_dirs()
+        self.assertEqual(result, [])
 
 
 class TestGlobalPythonDiscovery(unittest.TestCase):
@@ -240,6 +369,17 @@ class TestAuditor(unittest.TestCase):
                 report.worst_classification,
                 Classification.COMPROMISED_CANDIDATE,
             )
+
+    def test_dedup_between_repo_and_standalone(self):
+        """Same site-packages found by both RepoVenv and Standalone is checked once."""
+        with tempfile.TemporaryDirectory() as d:
+            _make_repo_with_venv(Path(d), "my_repo")
+            discoveries = [
+                RepoVenvDiscovery([Path(d)]),
+                StandaloneVenvDiscovery([Path(d)]),
+            ]
+            report = Auditor(discoveries).run()
+            self.assertEqual(report.total_checked, 1)
 
 
 if __name__ == "__main__":

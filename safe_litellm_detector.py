@@ -39,9 +39,7 @@ from typing import Sequence
 _COMPROMISED_VERSIONS: frozenset[str] = frozenset({"1.82.8"})
 _SUSPICIOUS_VERSIONS: frozenset[str] = frozenset({"1.82.7"})
 
-_VENV_DIR_NAMES: tuple[str, ...] = (
-    ".venv", "venv", "env", ".env", "ENV", "virtenv", ".virtenv",
-)
+_IS_WINDOWS = sys.platform == "win32"
 
 # Matches ``litellm-1.82.8.dist-info`` → ``1.82.8``.
 _DIST_INFO_VERSION_RE = re.compile(r"^litellm-(.+)\.dist-info$")
@@ -401,11 +399,14 @@ EXIT_COMPROMISED = 2
 EXIT_ERROR = 3
 
 
-_IS_WINDOWS = sys.platform == "win32"
+def _ansi_supported() -> bool:
+    """Returns True if stdout supports ANSI escapes, enabling them on Windows.
 
-
-def _enable_ansi_if_needed() -> bool:
-    """Enables ANSI escape processing on Windows; returns True if supported."""
+    Called lazily on first use — not at import time — to avoid mutating
+    terminal state when the module is imported as a library.
+    """
+    if not sys.stdout.isatty():
+        return False
     if not _IS_WINDOWS:
         return True
     try:
@@ -421,28 +422,23 @@ def _enable_ansi_if_needed() -> bool:
     return False
 
 
-class _Colors:
-    """ANSI escape sequences (disabled when stdout is not a TTY or unsupported)."""
-
-    _on = sys.stdout.isatty() and _enable_ansi_if_needed()
-
-    GREEN = "\033[92m" if _on else ""
-    RED = "\033[91m" if _on else ""
-    YELLOW = "\033[93m" if _on else ""
-    BOLD = "\033[1m" if _on else ""
-    RESET = "\033[0m" if _on else ""
+def _c(code: str) -> str:
+    """Returns *code* if ANSI is supported, otherwise an empty string."""
+    # Lazy one-shot evaluation, cached on the function object.
+    if not hasattr(_c, "_on"):
+        _c._on = _ansi_supported()  # type: ignore[attr-defined]
+    return code if _c._on else ""  # type: ignore[attr-defined]
 
 
 def format_report_text(reports: Sequence[TargetReport]) -> str:
     """Renders reports as human-readable text."""
-    c = _Colors
     lines: list[str] = []
 
     for report in reports:
-        lines.append(f"\n{c.BOLD}Target: {report.target}{c.RESET}")
+        lines.append(f"\n{_c(_BOLD)}Target: {report.target}{_c(_RESET)}")
 
         if not report.site_packages:
-            lines.append(f"  {c.YELLOW}No site-packages directories found.{c.RESET}")
+            lines.append(f"  {_c(_YELLOW)}No site-packages directories found.{_c(_RESET)}")
             continue
 
         for f in report.site_packages:
@@ -451,30 +447,36 @@ def format_report_text(reports: Sequence[TargetReport]) -> str:
     return "\n".join(lines)
 
 
+_GREEN = "\033[92m"
+_RED = "\033[91m"
+_YELLOW = "\033[93m"
+_BOLD = "\033[1m"
+_RESET = "\033[0m"
+
+_CLS_COLORS: dict[Classification, str] = {
+    Classification.CLEAN: _GREEN,
+    Classification.SUSPICIOUS: _YELLOW,
+    Classification.COMPROMISED_CANDIDATE: _RED,
+}
+_CLS_ICONS: dict[Classification, str] = {
+    Classification.CLEAN: "✔",
+    Classification.SUSPICIOUS: "⚠",
+    Classification.COMPROMISED_CANDIDATE: "✘",
+}
+
+
 def _append_finding_text(lines: list[str], f: SitePackagesFinding) -> None:
     """Appends formatted text lines for one finding."""
-    c = _Colors
+    color = _CLS_COLORS[f.classification]
+    icon = _CLS_ICONS[f.classification]
 
-    cls_colors = {
-        Classification.CLEAN: c.GREEN,
-        Classification.SUSPICIOUS: c.YELLOW,
-        Classification.COMPROMISED_CANDIDATE: c.RED,
-    }
-    cls_icons = {
-        Classification.CLEAN: "✔",
-        Classification.SUSPICIOUS: "⚠",
-        Classification.COMPROMISED_CANDIDATE: "✘",
-    }
-    color = cls_colors[f.classification]
-    icon = cls_icons[f.classification]
-
-    lines.append(f"  {color}{icon}{c.RESET} {f.path}")
+    lines.append(f"  {_c(color)}{icon}{_c(_RESET)} {f.path}")
     lines.append(
-        f"    Status: {color}{c.BOLD}{f.classification.value}{c.RESET}"
+        f"    Status: {_c(color)}{_c(_BOLD)}{f.classification.value}{_c(_RESET)}"
     )
 
     if f.reasons:
-        lines.append(f"    Reasons:")
+        lines.append("    Reasons:")
         for reason in f.reasons:
             lines.append(f"      - {reason}")
 
@@ -482,11 +484,11 @@ def _append_finding_text(lines: list[str], f: SitePackagesFinding) -> None:
         lines.append(f"    Version: {f.version}")
     if f.pth_present:
         lines.append(
-            f"    {c.RED}{c.BOLD}litellm_init.pth BACKDOOR PRESENT{c.RESET}"
+            f"    {_c(_RED)}{_c(_BOLD)}litellm_init.pth BACKDOOR PRESENT{_c(_RESET)}"
         )
     if f.record_mentions_pth:
         lines.append(
-            f"    {c.RED}RECORD references litellm_init.pth{c.RESET}"
+            f"    {_c(_RED)}RECORD references litellm_init.pth{_c(_RESET)}"
         )
 
 
@@ -524,8 +526,136 @@ def _safe_glob(root: Path, pattern: str) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Global Python discovery
 # ---------------------------------------------------------------------------
+
+_WELL_KNOWN_PYTHONS_UNIX: tuple[str, ...] = (
+    "/usr/bin/python3",
+    "/usr/local/bin/python3",
+    "/opt/homebrew/bin/python3",
+)
+
+_PYTHON_EXE_RE = re.compile(
+    r"^python\d?(\.\d+)?(\.exe)?$" if _IS_WINDOWS
+    else r"^python\d?(\.\d+)?$"
+)
+
+
+def _pythons_on_path() -> list[Path]:
+    """Yields ``python*`` executables found on ``$PATH``."""
+    results: list[Path] = []
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            for entry in Path(directory).iterdir():
+                if _PYTHON_EXE_RE.match(entry.name) and entry.is_file():
+                    results.append(entry)
+        except (PermissionError, OSError):
+            continue
+    return results
+
+
+def _well_known_pythons_windows() -> list[Path]:
+    """Yields common Python install locations on Windows."""
+    results: list[Path] = []
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    if localappdata:
+        results.extend(sorted(
+            Path(localappdata, "Programs", "Python").glob("Python*/python.exe")
+        ))
+
+    for root in (os.environ.get("PROGRAMFILES", ""),
+                 os.environ.get("PROGRAMFILES(X86)", "")):
+        if root:
+            results.extend(sorted(Path(root).glob("Python*/python.exe")))
+
+    appdata = os.environ.get("LOCALAPPDATA", "")
+    if appdata:
+        pkgs = Path(appdata, "Microsoft", "WindowsApps")
+        if pkgs.is_dir():
+            for entry in sorted(pkgs.glob("python*.exe")):
+                if _PYTHON_EXE_RE.match(entry.name) and entry.is_file():
+                    results.append(entry)
+    return results
+
+
+def _collect_global_pythons() -> list[Path]:
+    """Returns candidate Python executables (never runs them)."""
+    results: list[Path] = [Path(sys.executable)]
+
+    if _IS_WINDOWS:
+        results.extend(_well_known_pythons_windows())
+    else:
+        for p in _WELL_KNOWN_PYTHONS_UNIX:
+            path = Path(p)
+            if path.exists():
+                results.append(path)
+
+    results.extend(_pythons_on_path())
+    return results
+
+
+def _safe_resolve(path: Path) -> Path | None:
+    """Resolves a symlink / relative path, returning ``None`` on failure."""
+    try:
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def _site_packages_for_python(python: Path) -> list[Path]:
+    """Infers ``site-packages`` from *python*'s filesystem location."""
+    results: list[Path] = []
+    resolved = _safe_resolve(python)
+    if resolved is None:
+        return results
+
+    if _IS_WINDOWS:
+        prefix = resolved.parent
+    else:
+        prefix = resolved.parent.parent
+
+    results.extend(prefix.glob("lib/python*/site-packages"))
+
+    lib_sp = prefix / "Lib" / "site-packages"
+    if lib_sp.is_dir():
+        results.append(lib_sp)
+
+    if not _IS_WINDOWS:
+        results.extend(
+            Path("/opt/homebrew/lib").glob("python*/site-packages")
+        )
+        results.extend(
+            Path("/usr/local/lib").glob("python*/site-packages")
+        )
+        for clt in (
+                Path("/Library/Developer/CommandLineTools/Library/Frameworks/"
+                     "Python3.framework/Versions"),
+                Path("/Applications/Xcode.app/Contents/Developer/Library/"
+                     "Frameworks/Python3.framework/Versions"),
+        ):
+            if clt.is_dir():
+                results.extend(clt.glob("*/lib/python*/site-packages"))
+
+    return [p for p in results if p.is_dir()]
+
+
+def discover_global_site_packages() -> list[tuple[str, Path]]:
+    """Discovers ``site-packages`` for all global Python installations.
+
+    Returns a list of ``(label, site_packages_path)`` pairs.  The
+    interpreters are **never executed** — paths are inferred from the
+    filesystem layout.
+    """
+    seen: set[Path] = set()
+    results: list[tuple[str, Path]] = []
+    for python in _collect_global_pythons():
+        for sp in _site_packages_for_python(python):
+            resolved = _safe_resolve(sp)
+            if resolved is None or resolved in seen:
+                continue
+            seen.add(resolved)
+            results.append((f"System ({python})", sp))
+    return results
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -558,6 +688,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Recursively search for site-packages under each target.",
     )
     parser.add_argument(
+        "--no-global",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip global Python installations when --recursive is used.  "
+            "By default, --recursive also scans global installs."
+        ),
+    )
+    parser.add_argument(
         "--strict-1827",
         action="store_true",
         default=False,
@@ -585,11 +724,16 @@ def _expand_recursive(targets: Sequence[Path]) -> list[Path]:
 
         found_any = False
         for sp in _safe_glob(target, "**/site-packages"):
-            # Walk up to the env root: .../lib/pythonX.Y/site-packages → ...
-            # or .../Lib/site-packages → ...
-            env_root = sp.parent.parent.parent  # lib/pythonX.Y/site-packages
-            if env_root.name == "lib" or env_root.name == "Lib":
-                env_root = env_root.parent
+            # Walk from site-packages up to the env root.
+            #   lib/pythonX.Y/site-packages → 3 levels
+            #   Lib/site-packages            → 2 levels
+            parent = sp.parent
+            if parent.name.startswith("python"):
+                # lib/pythonX.Y/site-packages
+                env_root = parent.parent.parent
+            else:
+                # Lib/site-packages (Windows) or unknown layout
+                env_root = parent.parent
             try:
                 resolved = env_root.resolve()
             except OSError:
@@ -618,20 +762,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         targets = _expand_recursive(targets)
 
     reports: list[TargetReport] = []
+    errors: list[str] = []
     for target in targets:
         try:
             reports.append(scan_target(target, strict_1827=args.strict_1827))
         except Exception as exc:
-            if not args.quiet:
-                print(f"Error scanning {target}: {exc}", file=sys.stderr)
-            return EXIT_ERROR
+            errors.append(f"Error scanning {target}: {exc}")
+
+    # When --recursive is active, also scan global Python installations
+    # (unless suppressed with --no-global) so that the detector's output
+    # covers the same ground as the fleet auditor.
+    if args.recursive and not args.no_global:
+        seen: set[Path] = set()
+        for report in reports:
+            for finding in report.site_packages:
+                resolved = _safe_resolve(finding.path)
+                if resolved is not None:
+                    seen.add(resolved)
+
+        for label, sp in discover_global_site_packages():
+            resolved = _safe_resolve(sp)
+            if resolved is None or resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                reports.append(scan_target(sp, strict_1827=args.strict_1827))
+            except Exception as exc:
+                errors.append(f"Error scanning {sp}: {exc}")
 
     if not args.quiet:
+        for msg in errors:
+            print(msg, file=sys.stderr)
         if args.json_output:
             print(format_report_json(reports))
         else:
             print(format_report_text(reports))
 
+    if errors and not reports:
+        return EXIT_ERROR
     return worst_exit_code(reports)
 
 
