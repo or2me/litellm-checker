@@ -45,13 +45,18 @@ _VENV_DIR_NAMES: tuple[str, ...] = (
     ".venv", "venv", "env", ".env", "ENV", "virtenv", ".virtenv",
 )
 
-_WELL_KNOWN_PYTHONS: tuple[str, ...] = (
+_IS_WINDOWS = sys.platform == "win32"
+
+_WELL_KNOWN_PYTHONS_UNIX: tuple[str, ...] = (
     "/usr/bin/python3",
     "/usr/local/bin/python3",
     "/opt/homebrew/bin/python3",
 )
 
-_PYTHON_EXE_RE = re.compile(r"^python\d?(\.\d+)?$")
+_PYTHON_EXE_RE = re.compile(
+    r"^python\d?(\.\d+)?(\.exe)?$" if _IS_WINDOWS
+    else r"^python\d?(\.\d+)?$"
+)
 
 # ---------------------------------------------------------------------------
 # Domain models
@@ -177,10 +182,15 @@ class GlobalPythonDiscovery(EnvironmentDiscovery):
     def _collect_pythons() -> Iterable[Path]:
         """Yields candidate Python executables (never runs them)."""
         yield Path(sys.executable)
-        for p in _WELL_KNOWN_PYTHONS:
-            path = Path(p)
-            if path.exists():
-                yield path
+
+        if _IS_WINDOWS:
+            yield from _well_known_pythons_windows()
+        else:
+            for p in _WELL_KNOWN_PYTHONS_UNIX:
+                path = Path(p)
+                if path.exists():
+                    yield path
+
         yield from _pythons_on_path()
 
     @staticmethod
@@ -191,20 +201,39 @@ class GlobalPythonDiscovery(EnvironmentDiscovery):
         if resolved is None:
             return results
 
-        prefix = resolved.parent.parent
+        # On Unix, python lives at <prefix>/bin/pythonX.Y → two levels up.
+        # On Windows, python lives at <prefix>/python.exe → one level up.
+        if _IS_WINDOWS:
+            prefix = resolved.parent
+        else:
+            prefix = resolved.parent.parent
+
+        # Unix:    <prefix>/lib/pythonX.Y/site-packages
         results.extend(prefix.glob("lib/python*/site-packages"))
 
-        results.extend(Path("/opt/homebrew/lib").glob("python*/site-packages"))
-        results.extend(Path("/usr/local/lib").glob("python*/site-packages"))
+        # Windows: <prefix>/Lib/site-packages
+        lib_sp = prefix / "Lib" / "site-packages"
+        if lib_sp.is_dir():
+            results.append(lib_sp)
 
-        for clt in (
-            Path("/Library/Developer/CommandLineTools/Library/Frameworks/"
-                 "Python3.framework/Versions"),
-            Path("/Applications/Xcode.app/Contents/Developer/Library/"
-                 "Frameworks/Python3.framework/Versions"),
-        ):
-            if clt.is_dir():
-                results.extend(clt.glob("*/lib/python*/site-packages"))
+        if not _IS_WINDOWS:
+            # macOS Homebrew
+            results.extend(
+                Path("/opt/homebrew/lib").glob("python*/site-packages")
+            )
+            results.extend(
+                Path("/usr/local/lib").glob("python*/site-packages")
+            )
+
+            # macOS Xcode / CommandLineTools
+            for clt in (
+                Path("/Library/Developer/CommandLineTools/Library/Frameworks/"
+                     "Python3.framework/Versions"),
+                Path("/Applications/Xcode.app/Contents/Developer/Library/"
+                     "Frameworks/Python3.framework/Versions"),
+            ):
+                if clt.is_dir():
+                    results.extend(clt.glob("*/lib/python*/site-packages"))
 
         return [p for p in results if p.is_dir()]
 
@@ -252,10 +281,28 @@ class Auditor:
 # ---------------------------------------------------------------------------
 
 
-class _Colors:
-    """ANSI escape sequences (disabled when stdout is not a TTY)."""
+def _enable_ansi_if_needed() -> bool:
+    """Enables ANSI escape processing on Windows; returns True if supported."""
+    if not _IS_WINDOWS:
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # STD_OUTPUT_HANDLE = -11, ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x4
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x4)
+            return True
+    except Exception:
+        pass
+    return False
 
-    _on = sys.stdout.isatty()
+
+class _Colors:
+    """ANSI escape sequences (disabled when stdout is not a TTY or unsupported)."""
+
+    _on = sys.stdout.isatty() and _enable_ansi_if_needed()
 
     GREEN = "\033[92m" if _on else ""
     RED = "\033[91m" if _on else ""
@@ -366,13 +413,38 @@ def print_json_report(report: AuditReport) -> None:
 
 def _pythons_on_path() -> Iterable[Path]:
     """Yields ``python*`` executables found on ``$PATH``."""
-    for directory in os.environ.get("PATH", "").split(":"):
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
         try:
             for entry in Path(directory).iterdir():
                 if _PYTHON_EXE_RE.match(entry.name) and entry.is_file():
                     yield entry
         except (PermissionError, OSError):
             continue
+
+
+def _well_known_pythons_windows() -> Iterable[Path]:
+    """Yields common Python install locations on Windows."""
+    # Python.org installer defaults
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    if localappdata:
+        yield from sorted(
+            Path(localappdata, "Programs", "Python").glob("Python*/python.exe")
+        )
+
+    # System-wide installs
+    for root in (os.environ.get("PROGRAMFILES", ""),
+                 os.environ.get("PROGRAMFILES(X86)", "")):
+        if root:
+            yield from sorted(Path(root).glob("Python*/python.exe"))
+
+    # Windows Store / App Installer
+    appdata = os.environ.get("LOCALAPPDATA", "")
+    if appdata:
+        pkgs = Path(appdata, "Microsoft", "WindowsApps")
+        if pkgs.is_dir():
+            for entry in sorted(pkgs.glob("python*.exe")):
+                if _PYTHON_EXE_RE.match(entry.name) and entry.is_file():
+                    yield entry
 
 
 def _safe_resolve(path: Path) -> Path | None:

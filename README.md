@@ -7,10 +7,10 @@ Incident-response-safe detection of compromised `litellm` installations.
 
 Versions 1.82.7 and 1.82.8 of `litellm` shipped malicious code:
 
-| Version | Payload | Trigger |
-|---|---|---|
-| 1.82.7 | `litellm/proxy/proxy_server.py` | `import litellm.proxy` |
-| 1.82.8 | `litellm_init.pth` in `site-packages` | **Any** Python startup (`python`, `pip`, etc.) |
+| Version | Payload                               | Trigger                                        |
+|---------|---------------------------------------|------------------------------------------------|
+| 1.82.7  | `litellm/proxy/proxy_server.py`       | `import litellm.proxy`                         |
+| 1.82.8  | `litellm_init.pth` in `site-packages` | **Any** Python startup (`python`, `pip`, etc.) |
 
 Running `python`, `pip`, or any entrypoint from an affected environment
 **executes the payload**.  These tools avoid that entirely — they read package
@@ -44,33 +44,33 @@ python3 audit_litellm.py --strict-1827 --quiet
 
 ## Classification Model
 
-| Classification | Meaning |
-|---|---|
-| **clean** | No `litellm` artifacts found |
-| **suspicious** | `litellm` present but no high-confidence IOCs (e.g. benign version, malformed metadata, missing dist-info) |
+| Classification            | Meaning                                                                                                                  |
+|---------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| **clean**                 | No `litellm` artifacts found                                                                                             |
+| **suspicious**            | `litellm` present but no high-confidence IOCs (e.g. benign version, malformed metadata, missing dist-info)               |
 | **compromised-candidate** | Matches known IOCs: version 1.82.8, `litellm_init.pth`, RECORD references `.pth`, or version 1.82.7 with `--strict-1827` |
 
 ## What It Checks
 
 For every `site-packages` directory:
 
-| Artifact | Signal |
-|---|---|
-| `litellm/` directory | Package present |
-| `litellm-*.dist-info/METADATA` | Version extraction |
-| `litellm-*.dist-info/RECORD` | Manifest reference to `.pth` |
-| `litellm_init.pth` | **Backdoor** (1.82.8 indicator) |
-| Multiple `dist-info` dirs | Suspicious (version conflict) |
-| Missing / malformed metadata | Suspicious |
+| Artifact                       | Signal                          |
+|--------------------------------|---------------------------------|
+| `litellm/` directory           | Package present                 |
+| `litellm-*.dist-info/METADATA` | Version extraction              |
+| `litellm-*.dist-info/RECORD`   | Manifest reference to `.pth`    |
+| `litellm_init.pth`             | **Backdoor** (1.82.8 indicator) |
+| Multiple `dist-info` dirs      | Suspicious (version conflict)   |
+| Missing / malformed metadata   | Suspicious                      |
 
 ## Exit Codes
 
-| Code | Meaning |
-|---|---|
-| `0` | clean |
-| `1` | suspicious |
-| `2` | compromised-candidate |
-| `3` | operational error |
+| Code | Meaning               |
+|------|-----------------------|
+| `0`  | clean                 |
+| `1`  | suspicious            |
+| `2`  | compromised-candidate |
+| `3`  | operational error     |
 
 ## Sample Output
 
@@ -142,3 +142,4 @@ python3 -m unittest test_audit -v
 - Python 3.10+
 - Standard library only — no third-party dependencies
 - **Zero subprocess calls** — safe by design
+- Cross-platform: macOS, Linux, Windows

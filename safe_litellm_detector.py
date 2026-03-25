@@ -401,10 +401,30 @@ EXIT_COMPROMISED = 2
 EXIT_ERROR = 3
 
 
-class _Colors:
-    """ANSI escape sequences (disabled when stdout is not a TTY)."""
+_IS_WINDOWS = sys.platform == "win32"
 
-    _on = sys.stdout.isatty()
+
+def _enable_ansi_if_needed() -> bool:
+    """Enables ANSI escape processing on Windows; returns True if supported."""
+    if not _IS_WINDOWS:
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x4)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+class _Colors:
+    """ANSI escape sequences (disabled when stdout is not a TTY or unsupported)."""
+
+    _on = sys.stdout.isatty() and _enable_ansi_if_needed()
 
     GREEN = "\033[92m" if _on else ""
     RED = "\033[91m" if _on else ""
