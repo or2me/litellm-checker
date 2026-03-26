@@ -6,12 +6,16 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from safe_litellm_detector import (
     Classification,
     TargetReport,
+    build_everything_json_url,
     classify,
+    discover_everything_targets,
     discover_site_packages,
+    format_report_html,
     format_report_json,
     format_report_text,
     inspect_site_packages,
@@ -65,6 +69,22 @@ def _plant_pth(sp: Path) -> None:
     (sp / "litellm_init.pth").write_text("import os\n")
 
 
+class _FakeHttpResponse:
+    """Minimal HTTP response stub for Everything fetch tests."""
+
+    def __init__(self, payload: str) -> None:
+        self._payload = payload.encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 — discover_site_packages
 # ---------------------------------------------------------------------------
@@ -114,7 +134,10 @@ class TestDiscoverSitePackages(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             sp = _make_site_packages(Path(d) / "real_env")
             link = Path(d) / "linked_env"
-            link.symlink_to(Path(d) / "real_env")
+            try:
+                link.symlink_to(Path(d) / "real_env")
+            except OSError as exc:
+                self.skipTest(f"当前环境不允许创建符号链接: {exc}")
             # Discover from a parent that contains both
             parent = Path(d)
             result = discover_site_packages(parent)
@@ -227,7 +250,7 @@ class TestClassify(unittest.TestCase):
             metadata_readable=True,
         )
         self.assertEqual(cls, Classification.COMPROMISED_CANDIDATE)
-        self.assertIn("version=1.82.8", reasons)
+        self.assertIn("版本=1.82.8", reasons)
 
     def test_compromised_pth_present(self):
         """litellm_init.pth present → compromised-candidate."""
@@ -237,7 +260,7 @@ class TestClassify(unittest.TestCase):
             metadata_readable=True,
         )
         self.assertEqual(cls, Classification.COMPROMISED_CANDIDATE)
-        self.assertIn("litellm_init.pth present", reasons)
+        self.assertIn("存在 litellm_init.pth", reasons)
 
     def test_compromised_record_mentions_pth(self):
         """RECORD references .pth → compromised-candidate."""
@@ -247,7 +270,7 @@ class TestClassify(unittest.TestCase):
             metadata_readable=True,
         )
         self.assertEqual(cls, Classification.COMPROMISED_CANDIDATE)
-        self.assertIn("RECORD mentions litellm_init.pth", reasons)
+        self.assertIn("RECORD 中提到了 litellm_init.pth", reasons)
 
     def test_suspicious_version_1827(self):
         """Version 1.82.7 without strict mode → suspicious."""
@@ -257,7 +280,7 @@ class TestClassify(unittest.TestCase):
             metadata_readable=True,
         )
         self.assertEqual(cls, Classification.SUSPICIOUS)
-        self.assertIn("version=1.82.7", reasons)
+        self.assertIn("版本=1.82.7", reasons)
 
     def test_strict_1827_escalates(self):
         """Version 1.82.7 with strict mode → compromised-candidate."""
@@ -276,9 +299,7 @@ class TestClassify(unittest.TestCase):
             metadata_readable=True,
         )
         self.assertEqual(cls, Classification.SUSPICIOUS)
-        self.assertTrue(
-            any("without dist-info" in r for r in reasons)
-        )
+        self.assertTrue(any("缺少 dist-info" in r for r in reasons))
 
     def test_suspicious_multiple_dist_info(self):
         """Multiple dist-info directories → suspicious."""
@@ -288,7 +309,7 @@ class TestClassify(unittest.TestCase):
             metadata_readable=True,
         )
         self.assertEqual(cls, Classification.SUSPICIOUS)
-        self.assertTrue(any("multiple" in r for r in reasons))
+        self.assertTrue(any("多个 dist-info" in r for r in reasons))
 
     def test_suspicious_unreadable_metadata(self):
         """Unreadable metadata → suspicious."""
@@ -298,7 +319,7 @@ class TestClassify(unittest.TestCase):
             metadata_readable=False,
         )
         self.assertEqual(cls, Classification.SUSPICIOUS)
-        self.assertTrue(any("malformed" in r for r in reasons))
+        self.assertTrue(any("元数据缺失或格式异常" in r for r in reasons))
 
     def test_suspicious_benign_version_present(self):
         """Benign version installed → suspicious (still flagged as present)."""
@@ -318,9 +339,9 @@ class TestClassify(unittest.TestCase):
             metadata_readable=True,
         )
         self.assertEqual(cls, Classification.COMPROMISED_CANDIDATE)
-        self.assertIn("version=1.82.8", reasons)
-        self.assertIn("litellm_init.pth present", reasons)
-        self.assertIn("RECORD mentions litellm_init.pth", reasons)
+        self.assertIn("版本=1.82.8", reasons)
+        self.assertIn("存在 litellm_init.pth", reasons)
+        self.assertIn("RECORD 中提到了 litellm_init.pth", reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +489,8 @@ class TestReporting(unittest.TestCase):
             _make_site_packages(Path(d))
             report = scan_target(Path(d))
             text = format_report_text([report])
-            self.assertIn("clean", text)
+            self.assertIn("状态", text)
+            self.assertIn("正常", text)
 
     def test_exit_code_clean(self):
         """Clean reports → exit code 0."""
@@ -504,6 +526,56 @@ class TestReporting(unittest.TestCase):
             # Must not raise
             json.dumps(d_out)
             self.assertEqual(d_out["classification"], "compromised-candidate")
+
+    def test_everything_json_url_adds_required_query_args(self):
+        """Everything URL should be rewritten to JSON mode with full path data."""
+        url = build_everything_json_url("http://127.0.0.1/?search=litellm")
+        self.assertIn("search=litellm", url)
+        self.assertIn("json=1", url)
+        self.assertIn("path_column=1", url)
+        self.assertIn("count=4294967295", url)
+
+    @patch("safe_litellm_detector.urlopen")
+    def test_everything_targets_are_deduplicated_by_site_packages(self, mock_urlopen):
+        """Multiple Everything hits in one site-packages should only scan once."""
+        payload = json.dumps(
+            {
+                "results": [
+                    {
+                        "path": r"C:\env\Lib\site-packages",
+                        "name": "litellm_init.pth",
+                    },
+                    {
+                        "path": r"C:\env\Lib\site-packages\litellm",
+                        "name": "proxy_server.py",
+                    },
+                    {
+                        "path": r"C:\env\Lib\site-packages\litellm-1.82.8.dist-info",
+                        "name": "METADATA",
+                    },
+                ]
+            }
+        )
+        mock_urlopen.return_value = _FakeHttpResponse(payload)
+
+        targets = discover_everything_targets("http://127.0.0.1/?search=litellm")
+
+        self.assertEqual(targets, [Path(r"C:\env\Lib\site-packages")])
+
+    def test_html_report_sorts_problematic_results_first(self):
+        """HTML report should place compromised results before clean ones."""
+        with tempfile.TemporaryDirectory() as clean_dir, tempfile.TemporaryDirectory() as bad_dir:
+            clean_sp = _make_site_packages(Path(clean_dir))
+            bad_sp = _make_site_packages(Path(bad_dir))
+            _plant_litellm(bad_sp, version="1.82.8")
+            _plant_pth(bad_sp)
+
+            clean_report = scan_target(Path(clean_dir))
+            compromised_report = scan_target(Path(bad_dir))
+
+            html = format_report_html([clean_report, compromised_report], [])
+            self.assertIn("扫描报告", html)
+            self.assertLess(html.index(str(bad_sp)), html.index(str(clean_sp)))
 
 
 if __name__ == "__main__":

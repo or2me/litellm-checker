@@ -16,9 +16,11 @@ from audit_litellm import (
     AuditFinding,
     AuditReport,
     EnvKind,
+    EverythingDiscovery,
     GlobalPythonDiscovery,
     RepoVenvDiscovery,
     StandaloneVenvDiscovery,
+    _build_parser,
     _discover_windows_workspace_dirs,
 )
 
@@ -243,6 +245,26 @@ class TestGlobalPythonDiscovery(unittest.TestCase):
             self.assertEqual(kind, EnvKind.GLOBAL)
 
 
+class TestEverythingDiscovery(unittest.TestCase):
+    """Tests for Everything HTTP result integration."""
+
+    @patch("audit_litellm.discover_everything_targets")
+    def test_wraps_everything_targets_as_repository_findings(self, mock_discover):
+        """Everything results should become discovery items for auditor dedup."""
+        mock_discover.return_value = [
+            Path(r"C:\env\Lib\site-packages"),
+            Path(r"C:\other\Lib\site-packages"),
+        ]
+
+        discovery = EverythingDiscovery("http://127.0.0.1/?search=litellm")
+        results = list(discovery.discover())
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0][1], Path(r"C:\env\Lib\site-packages"))
+        self.assertEqual(results[0][2], EnvKind.REPOSITORY)
+        self.assertIn("Everything", results[0][0])
+
+
 # ---------------------------------------------------------------------------
 # Report model
 # ---------------------------------------------------------------------------
@@ -320,7 +342,10 @@ class TestAuditor(unittest.TestCase):
             _make_repo_with_venv(base, "repo_a")
             repo_b = base / "repo_b"
             (repo_b / ".git").mkdir(parents=True)
-            (repo_b / ".venv").symlink_to(base / "repo_a" / ".venv")
+            try:
+                (repo_b / ".venv").symlink_to(base / "repo_a" / ".venv")
+            except OSError as exc:
+                self.skipTest(f"当前环境不允许创建符号链接: {exc}")
 
             discovery = RepoVenvDiscovery([base])
             report = Auditor([discovery]).run()
@@ -380,6 +405,33 @@ class TestAuditor(unittest.TestCase):
             ]
             report = Auditor(discoveries).run()
             self.assertEqual(report.total_checked, 1)
+
+    def test_realtime_callback_receives_each_finding(self):
+        """Auditor should emit each finding as soon as it is scanned."""
+        with tempfile.TemporaryDirectory() as d:
+            sp = _make_repo_with_venv(Path(d))
+            _plant_litellm(sp, version="1.82.8")
+            callbacks: list[AuditFinding] = []
+
+            report = Auditor([RepoVenvDiscovery([Path(d)])]).run(
+                on_finding=callbacks.append,
+            )
+
+            self.assertEqual(report.total_checked, 1)
+            self.assertEqual(len(callbacks), 1)
+            self.assertEqual(
+                callbacks[0].detail.classification,
+                Classification.COMPROMISED_CANDIDATE,
+            )
+
+
+class TestCliParser(unittest.TestCase):
+    """Tests for CLI flags."""
+
+    def test_accepts_eve_flag(self):
+        """Parser should expose the Everything integration flag."""
+        args = _build_parser().parse_args(["--eve"])
+        self.assertTrue(args.eve)
 
 
 if __name__ == "__main__":

@@ -27,10 +27,14 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
+from html import escape
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -43,6 +47,8 @@ _IS_WINDOWS = sys.platform == "win32"
 
 # Matches ``litellm-1.82.8.dist-info`` → ``1.82.8``.
 _DIST_INFO_VERSION_RE = re.compile(r"^litellm-(.+)\.dist-info$")
+
+_EVERYTHING_MAX_RESULTS = "4294967295"
 
 # ---------------------------------------------------------------------------
 # Classification
@@ -282,16 +288,16 @@ def classify(
 
     # --- compromised-candidate signals ---
     if version in _COMPROMISED_VERSIONS:
-        reasons.append(f"version={version}")
+        reasons.append(f"版本={version}")
 
     if pth_present:
-        reasons.append("litellm_init.pth present")
+        reasons.append("存在 litellm_init.pth")
 
     if record_mentions_pth:
-        reasons.append("RECORD mentions litellm_init.pth")
+        reasons.append("RECORD 中提到了 litellm_init.pth")
 
     if strict_1827 and version in _SUSPICIOUS_VERSIONS:
-        reasons.append(f"version={version} (strict mode)")
+        reasons.append(f"版本={version}（严格模式）")
 
     if reasons:
         return Classification.COMPROMISED_CANDIDATE, reasons
@@ -300,24 +306,24 @@ def classify(
     suspicious_reasons: list[str] = []
 
     if version in _SUSPICIOUS_VERSIONS:
-        suspicious_reasons.append(f"version={version}")
+        suspicious_reasons.append(f"版本={version}")
 
     if not metadata_readable:
-        suspicious_reasons.append("metadata missing or malformed")
+        suspicious_reasons.append("元数据缺失或格式异常")
 
     if dist_info_count > 1:
         suspicious_reasons.append(
-            f"multiple dist-info directories ({dist_info_count})"
+            f"存在多个 dist-info 目录（{dist_info_count} 个）"
         )
 
     if dist_info_count == 0:
-        suspicious_reasons.append("package directory present without dist-info")
+        suspicious_reasons.append("存在包目录，但缺少 dist-info")
 
     if suspicious_reasons:
         return Classification.SUSPICIOUS, suspicious_reasons
 
     # --- present but no IOCs ---
-    return Classification.SUSPICIOUS, [f"litellm {version or '(unknown version)'} present"]
+    return Classification.SUSPICIOUS, [f"发现 litellm {version or '（未知版本）'}"]
 
 
 # ---------------------------------------------------------------------------
@@ -435,10 +441,10 @@ def format_report_text(reports: Sequence[TargetReport]) -> str:
     lines: list[str] = []
 
     for report in reports:
-        lines.append(f"\n{_c(_BOLD)}Target: {report.target}{_c(_RESET)}")
+        lines.append(f"\n{_c(_BOLD)}目标: {report.target}{_c(_RESET)}")
 
         if not report.site_packages:
-            lines.append(f"  {_c(_YELLOW)}No site-packages directories found.{_c(_RESET)}")
+            lines.append(f"  {_c(_YELLOW)}未找到 site-packages 目录。{_c(_RESET)}")
             continue
 
         for f in report.site_packages:
@@ -463,6 +469,26 @@ _CLS_ICONS: dict[Classification, str] = {
     Classification.SUSPICIOUS: "⚠",
     Classification.COMPROMISED_CANDIDATE: "✘",
 }
+_CLS_LABELS: dict[Classification, str] = {
+    Classification.CLEAN: "正常",
+    Classification.SUSPICIOUS: "可疑",
+    Classification.COMPROMISED_CANDIDATE: "疑似已被植入后门",
+}
+_CLS_PRIORITY: dict[Classification, int] = {
+    Classification.COMPROMISED_CANDIDATE: 0,
+    Classification.SUSPICIOUS: 1,
+    Classification.CLEAN: 2,
+}
+
+
+def classification_label(classification: Classification) -> str:
+    """Returns the Chinese label for a classification."""
+    return _CLS_LABELS[classification]
+
+
+def classification_priority(classification: Classification) -> int:
+    """Returns the sort priority for a classification."""
+    return _CLS_PRIORITY[classification]
 
 
 def _append_finding_text(lines: list[str], f: SitePackagesFinding) -> None:
@@ -472,23 +498,25 @@ def _append_finding_text(lines: list[str], f: SitePackagesFinding) -> None:
 
     lines.append(f"  {_c(color)}{icon}{_c(_RESET)} {f.path}")
     lines.append(
-        f"    Status: {_c(color)}{_c(_BOLD)}{f.classification.value}{_c(_RESET)}"
+        f"    状态: {_c(color)}{_c(_BOLD)}"
+        f"{classification_label(f.classification)}{_c(_RESET)}"
     )
 
     if f.reasons:
-        lines.append("    Reasons:")
+        lines.append("    原因:")
         for reason in f.reasons:
             lines.append(f"      - {reason}")
 
     if f.version:
-        lines.append(f"    Version: {f.version}")
+        lines.append(f"    版本: {f.version}")
     if f.pth_present:
         lines.append(
-            f"    {_c(_RED)}{_c(_BOLD)}litellm_init.pth BACKDOOR PRESENT{_c(_RESET)}"
+            f"    {_c(_RED)}{_c(_BOLD)}检测到 litellm_init.pth 后门文件"
+            f"{_c(_RESET)}"
         )
     if f.record_mentions_pth:
         lines.append(
-            f"    {_c(_RED)}RECORD references litellm_init.pth{_c(_RESET)}"
+            f"    {_c(_RED)}RECORD 引用了 litellm_init.pth{_c(_RESET)}"
         )
 
 
@@ -658,55 +686,277 @@ def discover_global_site_packages() -> list[tuple[str, Path]]:
     return results
 
 
+def prompt_everything_url() -> str:
+    """Prompts the user for an Everything HTTP result URL."""
+    url = input("请输入 Everything 搜索结果网址: ").strip()
+    if not url:
+        raise ValueError("Everything 搜索结果网址不能为空。")
+    return url
+
+
+def build_everything_json_url(url: str) -> str:
+    """Rewrites an Everything result URL into JSON mode with full paths."""
+    raw = url.strip()
+    if not raw:
+        raise ValueError("Everything 搜索结果网址不能为空。")
+
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            "Everything 搜索结果网址无效，请输入类似 "
+            "http://127.0.0.1/?search=litellm 的地址。"
+        )
+
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.pop("j", None)
+    query.pop("c", None)
+    query["json"] = "1"
+    query["path_column"] = "1"
+    query["count"] = _EVERYTHING_MAX_RESULTS
+    query["offset"] = "0"
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def _full_path_from_everything_result(item: object) -> Path | None:
+    """Builds a filesystem path from one Everything JSON result row."""
+    if not isinstance(item, dict):
+        return None
+
+    full_path = item.get("full_path")
+    if isinstance(full_path, str) and full_path:
+        return Path(full_path)
+
+    path = item.get("path")
+    name = item.get("name")
+    if isinstance(path, str) and path:
+        if isinstance(name, str) and name:
+            return Path(path) / name
+        return Path(path)
+    return None
+
+
+def _target_from_everything_result_path(candidate: Path) -> Path | None:
+    """Collapses Everything result paths onto a scan-worthy target."""
+    for current in (candidate, *candidate.parents):
+        if current.name == "site-packages":
+            return current
+
+    if candidate.exists():
+        discovered = discover_site_packages(candidate)
+        if discovered:
+            return discovered[0]
+
+    return candidate if candidate.name == "site-packages" else None
+
+
+def discover_everything_targets(url: str, *, timeout: float = 10.0) -> list[Path]:
+    """Fetches Everything results and returns de-duplicated scan targets."""
+    request = Request(
+        build_everything_json_url(url),
+        headers={"User-Agent": "litellm-check"},
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = response.read().decode("utf-8", errors="replace")
+
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Everything 返回的内容不是有效 JSON，请确认 HTTP 服务已开启。"
+        ) from exc
+
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise ValueError("Everything 返回的 JSON 中缺少 results 列表。")
+
+    targets: list[Path] = []
+    seen: set[Path] = set()
+    for item in results:
+        candidate = _full_path_from_everything_result(item)
+        if candidate is None:
+            continue
+
+        target = _target_from_everything_result_path(candidate)
+        if target is None:
+            continue
+
+        resolved = _safe_resolve(target) or target
+        if resolved in seen:
+            continue
+
+        seen.add(resolved)
+        targets.append(target)
+
+    return targets
+
+
+def format_report_html(
+    reports: Sequence[TargetReport],
+    errors: Sequence[str],
+) -> str:
+    """Renders reports as an HTML document."""
+    findings: list[tuple[Path, SitePackagesFinding]] = []
+    empty_targets: list[Path] = []
+    for report in reports:
+        if report.site_packages:
+            for finding in report.site_packages:
+                findings.append((report.target, finding))
+        else:
+            empty_targets.append(report.target)
+
+    findings.sort(
+        key=lambda item: (
+            classification_priority(item[1].classification),
+            str(item[0]).lower(),
+            str(item[1].path).lower(),
+        )
+    )
+
+    summary_counts = {
+        Classification.COMPROMISED_CANDIDATE: 0,
+        Classification.SUSPICIOUS: 0,
+        Classification.CLEAN: 0,
+    }
+    for _, finding in findings:
+        summary_counts[finding.classification] += 1
+
+    rows = []
+    for target, finding in findings:
+        reason_html = "<br>".join(escape(reason) for reason in finding.reasons) or "无"
+        version = escape(finding.version or "未知")
+        rows.append(
+            "<tr>"
+            f"<td>{escape(classification_label(finding.classification))}</td>"
+            f"<td>{escape(str(target))}</td>"
+            f"<td>{escape(str(finding.path))}</td>"
+            f"<td>{version}</td>"
+            f"<td>{reason_html}</td>"
+            "</tr>"
+        )
+
+    empty_items = "".join(
+        f"<li>{escape(str(target))}</li>" for target in sorted(empty_targets)
+    ) or "<li>无</li>"
+    error_items = "".join(
+        f"<li>{escape(message)}</li>" for message in errors
+    ) or "<li>无</li>"
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>litellm 扫描报告</title>
+  <style>
+    body {{ font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 24px; color: #1f2937; }}
+    h1, h2 {{ margin-bottom: 12px; }}
+    .summary {{ display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 12px; margin: 20px 0; }}
+    .card {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 14px; background: #f9fafb; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+    th, td {{ border: 1px solid #d1d5db; padding: 10px; vertical-align: top; text-align: left; }}
+    th {{ background: #f3f4f6; }}
+    ul {{ margin-top: 8px; }}
+  </style>
+</head>
+<body>
+  <h1>litellm 扫描报告</h1>
+  <p>生成时间: {escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}</p>
+  <div class="summary">
+    <div class="card"><strong>高风险</strong><br>{summary_counts[Classification.COMPROMISED_CANDIDATE]}</div>
+    <div class="card"><strong>可疑</strong><br>{summary_counts[Classification.SUSPICIOUS]}</div>
+    <div class="card"><strong>正常</strong><br>{summary_counts[Classification.CLEAN]}</div>
+    <div class="card"><strong>报错</strong><br>{len(errors)}</div>
+  </div>
+  <h2>扫描结果</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>状态</th>
+        <th>输入目标</th>
+        <th>site-packages</th>
+        <th>版本</th>
+        <th>原因</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(rows) or '<tr><td colspan="5">没有可展示的扫描结果。</td></tr>'}
+    </tbody>
+  </table>
+  <h2>未找到 site-packages 的目标</h2>
+  <ul>{empty_items}</ul>
+  <h2>错误信息</h2>
+  <ul>{error_items}</ul>
+</body>
+</html>"""
+
+
+def write_report_html(
+    reports: Sequence[TargetReport],
+    errors: Sequence[str],
+    *,
+    prefix: str = "litellm-check-report",
+) -> Path:
+    """Writes the HTML report to the current working directory."""
+    report_path = Path.cwd() / (
+        f"{prefix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
+    )
+    report_path.write_text(format_report_html(reports, errors), encoding="utf-8")
+    return report_path
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Constructs the argument parser."""
     parser = argparse.ArgumentParser(
         prog="safe_litellm_detector",
         description=(
-            "Incident-response-safe detector for compromised litellm "
-            "installations.  Inspects Python environments via filesystem "
-            "only — never executes a suspect interpreter."
+            "面向事件响应的 litellm 安全检测工具。"
+            "只读取文件系统，不执行任何可疑 Python 解释器。"
         ),
     )
     parser.add_argument(
         "targets",
         nargs="+",
         type=Path,
-        help="Paths to inspect (venv roots, site-packages dirs, or trees).",
+        help="要扫描的路径（虚拟环境根目录、site-packages 目录或目录树）。",
     )
     parser.add_argument(
         "--json",
         dest="json_output",
         action="store_true",
         default=False,
-        help="Emit JSON instead of human-readable text.",
+        help="输出 JSON，而不是中文文本报告。",
     )
     parser.add_argument(
         "--recursive",
         action="store_true",
         default=False,
-        help="Recursively search for site-packages under each target.",
+        help="递归搜索每个目标下的 site-packages。",
     )
     parser.add_argument(
         "--no-global",
         action="store_true",
         default=False,
         help=(
-            "Skip global Python installations when --recursive is used.  "
-            "By default, --recursive also scans global installs."
+            "配合 --recursive 使用时，跳过全局 Python 安装。"
+            "默认会一并扫描全局环境。"
         ),
     )
     parser.add_argument(
         "--strict-1827",
         action="store_true",
         default=False,
-        help="Treat version 1.82.7 as compromised-candidate instead of suspicious.",
+        help="把 1.82.7 也按疑似已被植入后门处理。",
     )
     parser.add_argument(
         "--quiet",
         action="store_true",
         default=False,
-        help="Suppress output; exit code only.",
+        help="静默模式，不输出文本，只保留退出码。",
+    )
+    parser.add_argument(
+        "--eve",
+        action="store_true",
+        default=False,
+        help="额外读取 Everything 搜索结果页中的路径，并去重后加入扫描。",
     )
     return parser
 
@@ -751,44 +1001,114 @@ def _expand_recursive(targets: Sequence[Path]) -> list[Path]:
     return expanded
 
 
+def _scan_targets(
+    targets: Sequence[Path],
+    *,
+    strict_1827: bool,
+    quiet: bool,
+    json_output: bool,
+    seen_site_packages: set[Path] | None = None,
+) -> tuple[list[TargetReport], list[str], set[Path]]:
+    """Scans targets once and de-duplicates discovered site-packages."""
+    reports: list[TargetReport] = []
+    errors: list[str] = []
+    seen_target_paths: set[Path] = set()
+    dedup_site_packages = seen_site_packages or set()
+
+    for target in targets:
+        resolved_target = _safe_resolve(target) or target
+        if resolved_target in seen_target_paths:
+            continue
+        seen_target_paths.add(resolved_target)
+
+        try:
+            report = scan_target(target, strict_1827=strict_1827)
+        except Exception as exc:
+            errors.append(f"扫描 {target} 时出错: {exc}")
+            continue
+
+        if report.site_packages:
+            unique_findings: list[SitePackagesFinding] = []
+            for finding in report.site_packages:
+                resolved_sp = _safe_resolve(finding.path) or finding.path
+                if resolved_sp in dedup_site_packages:
+                    continue
+                dedup_site_packages.add(resolved_sp)
+                unique_findings.append(finding)
+
+            if not unique_findings:
+                continue
+
+            report = TargetReport(
+                target=report.target,
+                site_packages=tuple(unique_findings),
+            )
+
+        reports.append(report)
+        if not quiet and not json_output:
+            print(format_report_text([report]), flush=True)
+
+    return reports, errors, dedup_site_packages
+
+
+def _format_summary_text(reports: Sequence[TargetReport], errors: Sequence[str]) -> str:
+    """Formats the final CLI summary."""
+    site_packages_count = sum(len(report.site_packages) for report in reports)
+    if errors and not reports:
+        verdict = "扫描过程中出现错误。"
+    else:
+        verdict = {
+            EXIT_CLEAN: "未发现异常。",
+            EXIT_SUSPICIOUS: "发现可疑项，建议人工复核。",
+            EXIT_COMPROMISED: "发现高风险疑似受污染环境，请立即处理。",
+        }.get(worst_exit_code(reports), "扫描过程中出现错误。")
+    return (
+        f"\n扫描完成，共检查 {site_packages_count} 个 site-packages 目录。"
+        f"\n最终结论: {verdict}"
+        f"\n错误数: {len(errors)}"
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point.  Returns an exit code."""
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     targets: list[Path] = [t.expanduser() for t in args.targets]
+    if args.eve:
+        try:
+            everything_targets = discover_everything_targets(prompt_everything_url())
+        except Exception as exc:
+            if not args.quiet:
+                print(f"读取 Everything 结果失败: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        targets.extend(everything_targets)
 
     if args.recursive:
         targets = _expand_recursive(targets)
 
-    reports: list[TargetReport] = []
-    errors: list[str] = []
-    for target in targets:
-        try:
-            reports.append(scan_target(target, strict_1827=args.strict_1827))
-        except Exception as exc:
-            errors.append(f"Error scanning {target}: {exc}")
+    reports, errors, seen_site_packages = _scan_targets(
+        targets,
+        strict_1827=args.strict_1827,
+        quiet=args.quiet,
+        json_output=args.json_output,
+    )
 
     # When --recursive is active, also scan global Python installations
     # (unless suppressed with --no-global) so that the detector's output
     # covers the same ground as the fleet auditor.
     if args.recursive and not args.no_global:
-        seen: set[Path] = set()
-        for report in reports:
-            for finding in report.site_packages:
-                resolved = _safe_resolve(finding.path)
-                if resolved is not None:
-                    seen.add(resolved)
+        global_reports, global_errors, seen_site_packages = _scan_targets(
+            [sp for _, sp in discover_global_site_packages()],
+            strict_1827=args.strict_1827,
+            quiet=args.quiet,
+            json_output=args.json_output,
+            seen_site_packages=seen_site_packages,
+        )
+        reports.extend(global_reports)
+        errors.extend(global_errors)
 
-        for label, sp in discover_global_site_packages():
-            resolved = _safe_resolve(sp)
-            if resolved is None or resolved in seen:
-                continue
-            seen.add(resolved)
-            try:
-                reports.append(scan_target(sp, strict_1827=args.strict_1827))
-            except Exception as exc:
-                errors.append(f"Error scanning {sp}: {exc}")
+    html_path = write_report_html(reports, errors)
 
     if not args.quiet:
         for msg in errors:
@@ -796,7 +1116,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.json_output:
             print(format_report_json(reports))
         else:
-            print(format_report_text(reports))
+            print(_format_summary_text(reports, errors))
+            print(f"HTML 报告已生成: {html_path}")
 
     if errors and not reports:
         return EXIT_ERROR

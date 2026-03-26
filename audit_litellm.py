@@ -21,16 +21,22 @@ import argparse
 import glob
 import os
 import sys
+from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from html import escape
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from safe_litellm_detector import (
     Classification,
     SitePackagesFinding,
+    classification_label,
+    classification_priority,
+    discover_everything_targets,
     discover_global_site_packages,
     inspect_site_packages,
+    prompt_everything_url,
     EXIT_ERROR,
     _c,
     _BOLD,
@@ -230,7 +236,18 @@ class GlobalPythonDiscovery(EnvironmentDiscovery):
 
     def discover(self) -> Iterable[tuple[str, Path, EnvKind]]:
         for label, sp in discover_global_site_packages():
-            yield label, sp, EnvKind.GLOBAL
+            yield label.replace("System", "系统环境"), sp, EnvKind.GLOBAL
+
+
+class EverythingDiscovery(EnvironmentDiscovery):
+    """Discovers additional targets from an Everything HTTP result page."""
+
+    def __init__(self, url: str) -> None:
+        self._url = url
+
+    def discover(self) -> Iterable[tuple[str, Path, EnvKind]]:
+        for sp in discover_everything_targets(self._url):
+            yield f"Everything 结果 ({sp})", sp, EnvKind.REPOSITORY
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +267,10 @@ class Auditor:
         self._discoveries = discoveries
         self._strict_1827 = strict_1827
 
-    def run(self) -> AuditReport:
+    def run(
+        self,
+        on_finding: Callable[[AuditFinding], None] | None = None,
+    ) -> AuditReport:
         """Executes the full audit and returns a report."""
         report = AuditReport()
         seen: set[Path] = set()
@@ -265,9 +285,12 @@ class Auditor:
                 detail = inspect_site_packages(
                     site_packages, strict_1827=self._strict_1827,
                 )
-                report.findings.append(AuditFinding(
+                finding = AuditFinding(
                     label=label, kind=kind, detail=detail,
-                ))
+                )
+                report.findings.append(finding)
+                if on_finding is not None:
+                    on_finding(finding)
         return report
 
 
@@ -278,14 +301,14 @@ class Auditor:
 
 def print_report(report: AuditReport) -> None:
     """Prints a human-readable audit report to stdout."""
-    _banner("AUDIT SUMMARY")
+    _banner("扫描汇总")
 
     if not report.findings:
-        print(f"{_c(_YELLOW)}No environments found to check.{_c(_RESET)}\n")
+        print(f"{_c(_YELLOW)}没有发现可检查的环境。{_c(_RESET)}\n")
     else:
         for kind, heading in (
-            (EnvKind.REPOSITORY, "Repository Virtual Environments"),
-            (EnvKind.GLOBAL, "Global Python Installations"),
+            (EnvKind.REPOSITORY, "项目环境"),
+            (EnvKind.GLOBAL, "全局 Python 环境"),
         ):
             group = report.by_kind(kind)
             if not group:
@@ -296,17 +319,17 @@ def print_report(report: AuditReport) -> None:
             print()
 
         print(
-            f"{_c(_BOLD)}Total environments checked: "
+            f"{_c(_BOLD)}已检查环境总数: "
             f"{report.total_checked}{_c(_RESET)}"
         )
 
-    _banner("FINAL VERDICT")
+    _banner("最终结论")
     worst = report.worst_classification
     color = _CLS_COLORS[worst]
     verdicts = {
-        Classification.CLEAN: "no issues found",
-        Classification.SUSPICIOUS: "suspicious — review needed",
-        Classification.COMPROMISED_CANDIDATE: "possibly compromised",
+        Classification.CLEAN: "未发现异常",
+        Classification.SUSPICIOUS: "发现可疑项，建议人工复核",
+        Classification.COMPROMISED_CANDIDATE: "发现高风险疑似受污染环境",
     }
     print(f"{_c(color)}{_c(_BOLD)}{verdicts[worst]}{_c(_RESET)}")
 
@@ -325,7 +348,10 @@ def _print_finding(af: AuditFinding) -> None:
 
     print(f"\n  {_c(color)}{icon}{_c(_RESET)} {af.label}")
     print(f"      site-packages: {f.path}")
-    print(f"      Status: {_c(color)}{_c(_BOLD)}{f.classification.value}{_c(_RESET)}")
+    print(
+        f"      状态: {_c(color)}{_c(_BOLD)}"
+        f"{classification_label(f.classification)}{_c(_RESET)}"
+    )
 
     if f.reasons:
         for reason in f.reasons:
@@ -334,10 +360,10 @@ def _print_finding(af: AuditFinding) -> None:
     if f.pth_present:
         print(
             f"      {_c(_RED)}{_c(_BOLD)}"
-            f"litellm_init.pth BACKDOOR PRESENT{_c(_RESET)}"
+            f"检测到 litellm_init.pth 后门文件{_c(_RESET)}"
         )
     if f.record_mentions_pth:
-        print(f"      {_c(_RED)}RECORD references litellm_init.pth{_c(_RESET)}")
+        print(f"      {_c(_RED)}RECORD 引用了 litellm_init.pth{_c(_RESET)}")
 
 
 def print_json_report(report: AuditReport) -> None:
@@ -355,6 +381,119 @@ def print_json_report(report: AuditReport) -> None:
     print(json.dumps(data, indent=2))
 
 
+def print_realtime_finding(af: AuditFinding) -> None:
+    """Prints a finding immediately when it is scanned."""
+    kind_label = {
+        EnvKind.REPOSITORY: "项目环境",
+        EnvKind.GLOBAL: "全局环境",
+    }[af.kind]
+    print(f"\n{_c(_BOLD)}[{kind_label}]{_c(_RESET)}", flush=True)
+    _print_finding(af)
+
+
+def print_summary(report: AuditReport, html_path: Path) -> None:
+    """Prints the final non-JSON summary."""
+    _banner("最终汇总")
+    print(f"已检查环境总数: {report.total_checked}")
+    verdicts = {
+        Classification.CLEAN: "未发现异常",
+        Classification.SUSPICIOUS: "发现可疑项，建议人工复核",
+        Classification.COMPROMISED_CANDIDATE: "发现高风险疑似受污染环境",
+    }
+    worst = report.worst_classification
+    print(
+        f"最终结论: {_c(_CLS_COLORS[worst])}{_c(_BOLD)}"
+        f"{verdicts[worst]}{_c(_RESET)}"
+    )
+    print(f"HTML 报告已生成: {html_path}")
+
+
+def format_audit_report_html(report: AuditReport) -> str:
+    """Renders the audit report as HTML, sorted by severity."""
+    rows = sorted(
+        report.findings,
+        key=lambda finding: (
+            classification_priority(finding.detail.classification),
+            finding.label.lower(),
+            str(finding.detail.path).lower(),
+        ),
+    )
+    counts = {
+        Classification.COMPROMISED_CANDIDATE: 0,
+        Classification.SUSPICIOUS: 0,
+        Classification.CLEAN: 0,
+    }
+    for finding in rows:
+        counts[finding.detail.classification] += 1
+
+    body_rows = []
+    for finding in rows:
+        reason_html = "<br>".join(
+            escape(reason) for reason in finding.detail.reasons
+        ) or "无"
+        source_label = {
+            EnvKind.REPOSITORY: "项目环境",
+            EnvKind.GLOBAL: "全局环境",
+        }[finding.kind]
+        body_rows.append(
+            "<tr>"
+            f"<td>{escape(classification_label(finding.detail.classification))}</td>"
+            f"<td>{escape(finding.label)}</td>"
+            f"<td>{escape(source_label)}</td>"
+            f"<td>{escape(str(finding.detail.path))}</td>"
+            f"<td>{escape(finding.detail.version or '未知')}</td>"
+            f"<td>{reason_html}</td>"
+            "</tr>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>litellm 审计报告</title>
+  <style>
+    body {{ font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 24px; color: #1f2937; }}
+    .summary {{ display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 12px; margin: 20px 0; }}
+    .card {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 14px; background: #f9fafb; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+    th, td {{ border: 1px solid #d1d5db; padding: 10px; vertical-align: top; text-align: left; }}
+    th {{ background: #f3f4f6; }}
+  </style>
+</head>
+<body>
+  <h1>litellm 审计报告</h1>
+  <div class="summary">
+    <div class="card"><strong>高风险</strong><br>{counts[Classification.COMPROMISED_CANDIDATE]}</div>
+    <div class="card"><strong>可疑</strong><br>{counts[Classification.SUSPICIOUS]}</div>
+    <div class="card"><strong>正常</strong><br>{counts[Classification.CLEAN]}</div>
+    <div class="card"><strong>总计</strong><br>{report.total_checked}</div>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>状态</th>
+        <th>标签</th>
+        <th>来源</th>
+        <th>site-packages</th>
+        <th>版本</th>
+        <th>原因</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(body_rows) or '<tr><td colspan="6">没有可展示的扫描结果。</td></tr>'}
+    </tbody>
+  </table>
+</body>
+</html>"""
+
+
+def write_audit_report_html(report: AuditReport) -> Path:
+    """Writes the audit HTML report to the current working directory."""
+    output = Path.cwd() / f"litellm-audit-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
+    output.write_text(format_audit_report_html(report), encoding="utf-8")
+    return output
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -365,10 +504,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="audit_litellm",
         description=(
-            "Scans project directories and global Python installations for "
-            "litellm.  On Windows, C:\\ws and C:\\ws_* (all caps variants) "
-            "are included automatically.  Uses filesystem-only inspection — "
-            "never executes a suspect interpreter."
+            "扫描项目目录和全局 Python 安装中的 litellm。"
+            "在 Windows 上会自动包含 C:\\ws 和 C:\\ws_*。"
+            "整个过程只读取文件系统，不执行任何可疑解释器。"
         ),
     )
     parser.add_argument(
@@ -376,26 +514,32 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="*",
         type=Path,
         metavar="DIR",
-        help="Additional directories to scan (beyond ~/projects, ~/work, and C:\\ws* on Windows).",
+        help="额外要扫描的目录（默认还会扫描 ~/projects、~/work 和 Windows 的 C:\\ws*）。",
     )
     parser.add_argument(
         "--json",
         dest="json_output",
         action="store_true",
         default=False,
-        help="Emit JSON instead of human-readable text.",
+        help="输出 JSON，而不是中文文本报告。",
     )
     parser.add_argument(
         "--strict-1827",
         action="store_true",
         default=False,
-        help="Treat version 1.82.7 as compromised-candidate.",
+        help="把 1.82.7 也按疑似已被植入后门处理。",
     )
     parser.add_argument(
         "--quiet",
         action="store_true",
         default=False,
-        help="Suppress output; exit code only.",
+        help="静默模式，不输出文本，只保留退出码。",
+    )
+    parser.add_argument(
+        "--eve",
+        action="store_true",
+        default=False,
+        help="额外读取 Everything 搜索结果页中的路径，并去重后加入扫描。",
     )
     return parser
 
@@ -457,15 +601,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         StandaloneVenvDiscovery([home] + root_dirs),
         GlobalPythonDiscovery(),
     ]
+    if args.eve:
+        try:
+            discoveries.append(EverythingDiscovery(prompt_everything_url()))
+        except Exception as exc:
+            if not args.quiet:
+                print(f"读取 Everything 结果失败: {exc}", file=sys.stderr)
+            return EXIT_ERROR
 
     auditor = Auditor(discoveries, strict_1827=args.strict_1827)
-    report = auditor.run()
+    report = auditor.run(
+        on_finding=print_realtime_finding
+        if (not args.quiet and not args.json_output)
+        else None,
+    )
+    html_path = write_audit_report_html(report)
 
     if not args.quiet:
         if args.json_output:
             print_json_report(report)
         else:
-            print_report(report)
+            print_summary(report, html_path)
 
     return _EXIT_FOR_CLASSIFICATION.get(
         report.worst_classification, EXIT_ERROR,
